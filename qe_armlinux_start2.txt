@@ -1,0 +1,82 @@
+本文介绍arm linux启动的第二部分，C语言编写，主要讲述start_kernel到1号进程的创建。主要讲述大概过程，以后再对子函数进行讲解。
+
+        一、start_kernel
+
+        start_kernel位于init/main.c，主要完成linux一些子系统的初始化。
+
+        1）smp_setup_processor_id() 单CPU位为空。
+
+        2）lock_kernel() 锁CPU，linux是支持抢占的，多CPU时调用这个函数防止其他CPU抢占。
+3）tick_init() 时间相关初始化
+4）boot_cpu_init() 确定有多少个CPU可用。现在以单CPU讲述。
+5）page_address_init() 初始化高端内存。linux内核空间为1G，对应最大能支持的物理内存也是1G。为了能够支持超过1G的内存，使用高端内存（128M）来进行映射处理。
+
+        6）setup_arch(&command_line)，位于arch/arm/kernel/setup.c 这个函数比较重要。
+
+        i  setup_processor 初始化CPU体系架构， setup_machine初始化平台数据结构
+
+                  ii   init_mm 初始化1号进程的task_struct
+
+                  iii parse_cmdline(cmdline_p, from) 获取default启动参数，取得相关的启动命令信息。
+
+                  iv  paging_init(&meminfo, mdesc); 创建正式页表
+
+                  v  request_standard_resources(&meminfo, mdesc); 申请IO资源
+
+                  vi 相关全局变量赋值 init_arch_irq = mdesc->init_irq; 
+   system_timer = mdesc->timer; 
+   init_machine = mdesc->init_machine;
+
+         7）mm_init_owner 初始化init的内存，arm体系为空
+
+    8）setup_command_line(command_line)获取uboot中的bootargs参数，取得相关的启动命令信息
+
+        9） setup_nr_cpu_ids();setup_per_cpu_areas();smp_prepare_boot_cpu() 多CPU函数
+
+       10）build_all_zonelists() 初始化所有内存管理节点列表，以便后面进行内存管理初始化。
+
+       11）page_alloc_init() 物理内存分配初始化。
+
+       12）parse_early_param() 获取命令行early最早执行部分的参数。
+
+       13) vfs_caches_init_early() vfs cache子系统初始化
+
+        14）mm_init() 内存管理初始化
+
+         15）sched_init（） 调度管理初始化
+
+         16）rcu_init() 初始化直接读拷贝更新的锁机制
+
+         17）init_IRQ 中断初始化
+
+        18）timer初始化，高精度time初始化
+
+        19）软中断初始化
+
+           20）local_irq_enable 开中断
+
+           21）console_init 初始化控制台，初始化之后以后prink就可以输出了，之前是输出到缓冲里面。
+
+           22）页表cache初始化
+
+            23）thread cache初始化
+
+            24）IPC初始化
+
+             25）异步信号初始化
+
+            26）还有一些其他多CPU相关的初始化。
+
+             27）rest_init 创建1号进程。
+
+        二、rest_init 
+
+              1）  kernel_thread(kernel_init, NULL, CLONE_FS | CLONE_SIGHAND); 创建1号进程init
+
+              2）创建kthreadd线程，它是内核线程之父，管理调度其它的内核线程，内核线程列表由kthread_create_list全局链表管理。
+
+             3） 创建idle线程消耗空CPU时间。
+
+         接下来，就是第三部分的kernel_init运行，即1号进程。 
+
+
