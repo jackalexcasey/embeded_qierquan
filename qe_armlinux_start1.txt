@@ -1,0 +1,132 @@
+  描述arm linux启动的概要过程，以S5PV210(Cortex A8)为例，本文描述第一个阶段。
+
+       一、arm linux的引导
+
+       uboot在引导arm linux（uImage镜像）到SDRAM之后，通过bootm命令对uImage镜像的64个字节头进行解释，获取linux的entry入口地址，并赋值给theKernel函数指针（一般该值是0x30008000），并将uboot的环境变量参数（如平台的内存块区域信息、linux启动命令信息bootargs等）按linux要求的tags形式放置在0x30000100起始的地方。接着关掉MMU，清除icache，dcache，最后通过该函数将控制权交给arm linux：
+
+       theKernel (0, machid, bd->bi_boot_params)；
+
+       其中，machid是平台的id，其需要与arch/arm/tools/mach_types 中定义的机器ID一致，否则无法启动。 bd->bi_boot_params即0x30000100，描述了linux启动所需要的信息。
+
+       二、arm linux启动的第一部分
+
+       该部分是体系相关的汇编部分，代码位于arch\arm\kernel\head.S，入口是ENTRY(stext)，其主要完成的工作包括：
+
+       1) 设置当前arm工作模式是svc mode，关中断
+
+       2）__lookup_processor_type 获取对应的CPU信息数据结构地址，主要是arm v7架构相关的信息，如MMU，cache标志值等，数据结构如下：
+
+struct proc_info_list {
+
+   unsigned int    cpu_val;
+
+   unsigned int    cpu_mask;
+
+   unsigned long     __cpu_mm_mmu_flags;   /* used by head.S */
+
+   unsigned long     __cpu_io_mmu_flags;   /* used by head.S */
+
+   unsigned long     __cpu_flush;    /* used by head.S */
+
+   const char      *arch_name;
+
+   const char      *elf_name;
+
+   unsigned int    elf_hwcap;
+
+   const char      *cpu_name;
+
+   struct processor   *proc;
+
+   struct cpu_tlb_fns *tlb;
+
+   struct cpu_user_fns   *user;
+
+   struct cpu_cache_fns  *cache;
+}; 
+
+       arm linux支持各种CPU体系架构，其描述在.proc.info.init 段，对应S5PV210即arch\arm\mm\proc-v7.S, lookup_processor_type先通过协处理器CP15读出CPU ID并跟cpu_val比较，匹配即可得到数据结构地址。该地址是链接到虚拟地址，而此时MMU是关闭的，需要将该地址转为物理地址访问。
+
+         3）__lookup_machine_type获取对应平台机器的数据结构地址，主要是平台板子相关的数据信息，如内存起始地址和大小，中断和timer初始化函数等，如下：          
+
+struct machine_desc {
+
+   unsigned int   nr;      /* architecture number   */
+
+   unsigned int    phys_io; /* start of physicalio  */
+
+   unsigned int    io_pg_offst; /* byte offsetfor io   * page tabe entry */
+
+   const char      *name;  /* architecture name  */
+
+   unsigned long      boot_params; /*tagged list     */
+
+   unsigned int    video_start; /* start of videoRAM */
+
+   unsigned int    video_end;  /* end ofvideo RAM   */
+
+   unsigned int    reserve_lp0 :1; /* never haslp0   */
+
+   unsigned int    reserve_lp1 :1; /* never haslp1   */
+
+   unsigned int    reserve_lp2 :1; /* never haslp2   */
+
+   unsigned int    soft_reboot :1; /* softreboot     */
+
+   void       (*fixup)(struct machine_desc *,   struct tag *, char **,    struct meminfo *);
+
+   void       (*map_io)(void);/* IO mapping function  */
+
+   void       (*init_irq)(void);
+
+   struct sys_timer   *timer;    /* system tick timer  */
+
+   void       (*init_machine)(void);
+
+};
+
+          arm linux支持各种平台板子，其描述在.arch.info.init 段，对应S5PV210即\arch\arm\mach-s5pv210\mach-smdkv210.c。UBOOT的machid即用于搜索匹配nr，以取到机器信息。
+
+        4）检查uboot传递过来的tags是否符合标准，并检测machine数据结构的boot_params的值是否等于theKernel传递过来的第三个参数（0x30000100）
+
+        5）create_page_tables 创建临时页表，均是以1M为单位进行映射，所以4G空间需要16K，从0x30004000到0X30008000。共映射三个部分：
+
+               i. linux内核镜像空间的映射（0xc0008***开始的内核空间映射到0x30008***）
+
+               ii. 创建页表到开启mmu之间还有一段代码需要运行，因为还需要为linux启动的初始1M空间创建一段直接映射，此时还是0X30008000+的地址运行，所以映射是0X30008000+映射到0X30008000+
+
+               iii. uboot传递过来的tags参数也需要进行映射(虚拟0XC**映射到0X3**），以进行访问。
+
+        6）ldr r13, __switch_data，将 __switch_data数据结构的地址入栈。
+
+        7）add   pc,r10, #PROCINFO_INITFUNC，即将PC改到arch\arm\mm\proc-v7.S的 __v7_setup去执行，跳转前将__enable_mmu放到lr，即 __v7_setup执行完就返回到__enable_mmu。 __v7_setup主要是CPU体系相关的初始化，如icache，dcache等。
+
+        8）__enable_mmu打开MMU，cache等，最后将r13出栈，取出arch/arm/kernel/head-common.S的__switch_data的第一个内容__mmap_switched函数，并赋给PC：
+
+__switch_data:
+
+   .long __mmap_switched
+
+   .long__data_loc         @ r4
+
+   .long_data           @ r5
+
+   .long __bss_start        @r6
+
+   .long_end            @ r7
+
+   .long processor_id       @ r4
+
+   .long __machine_arch_type      @ r5
+
+   .long __atags_pointer       @r6
+
+   .long cr_alignment       @ r7
+
+   .long init_thread_union + THREAD_START_SP @ sp
+
+         9）__mmap_switched初始化data，bss等相关段，保存相关的数据结构地址到相关变量。设置以后系统启动init进程的栈空间。
+
+        10）b  start_kernel 跳转到linux启动的第二部分，为C语言编写。 
+
+
