@@ -1,0 +1,243 @@
+Linux字符设备驱动剖析
+
+一、先看看设备应用程序
+
+1.很简单，open设备文件，read、write、ioctl，最后close退出。如下：
+
+intmain(int argc ,char *argv[]){
+
+    unsigned char val[1] = 1;
+
+    int fd =open("/dev/LED",O_RDWR);//打开设备
+
+    write(fd,val,1);//写入设备，这里代表LED全亮
+
+    close(fd);//关闭设备
+
+    return 0;
+
+}
+
+二、/dev目录与文件系统
+
+2./dev是根文件系统下的一个目录文件，/代表根目录，其挂载的是根文件系统的yaffs格式，通过读取/根目录这个文件，就能分析list出其包含的各个目录，其中就包括dev这个子目录。即在/根目录（也是一个文件，其真实存在于flash介质）中有一项这样的数据：
+
+文件属性 文件偏移 文件大小 文件名称 等等
+
+ls/ 命令即会使用/挂载的yaffs文件系统来读取出根目录文件的内容，然后list出dev（是一个目录）。即这时还不需要去读取dev这个目录文件的内容。Cd dev即会分析dev挂载的文件系统的超级块的信息,superblock，而不再理会在flash中的dev目录文件的数据。
+
+3./dev在根文件系统构建的时候会挂载为tmpfs. Tmpfs是一个基于虚拟内存的文件系统，主要使用RAM和SWAP（Ramfs只是使用物理内存）。即以后读写dev这个目录的操作都转到tmpfs的操作，确切地讲都是针对RAM的操作，而不再是通过yaffs文件系统的读写函数去访问flash介质。Tmpfs基于RAM，所以在掉电后回消失。因此/dev目录下的设备文件都是每次linux启动后创建的。
+
+挂载过程：/etc/init.d/rcS
+
+Mount –a 会读取/etc/fstab的内容来挂载，其内容如下：
+
+4./dev/NULL和/dev/console是在制作根文件系统的时候静态创建的，其他设备文件都是系统加载根文件系统和各种驱动初始化过程中自动创建的，当然也可以通过命令行手动mknod设备文件。
+
+三、设备文件的创建
+
+5./dev目录下的设备文件基本上都是通过mdev来动态创建的。mdev是一个用户态的应用程序，位于busybox工具箱中。其创建过程包括：
+
+1）驱动初始化或者总线匹配后会调用驱动的probe接口，该接口会调用device_create(设备类, 设备号, 设备名);在/sys/class/设备类目录生成唯一的设备属性文件（包括设备号和设备名等信息），并且发送uvent事件（KOBJ_ADD和环境变量，如路径等信息）到用户空间（通过socket方式）。
+
+2）mdev是一个work_thread线程，收到事件后会分析出/sys/class/设备类的对应文件，最终调用mknod动态来创建设备文件，而这个设备文件内容主要是设备号（这个设备文件对应的inode会记录文件的属性是一个设备（其他属性还包括目录，一般文件，符号链接等））。应用程序open(device_name,…)最重要的一步就是通过文件系统接口来获得该设备文件的内容—设备号。
+
+6.如果初始化过程中没有调用device_create接口来创建设备文件，则需要手动通过命令行调用mknod接口来创建设备文件，方可在应用程序中访问。
+
+7.mknod接口分析，通过系统调用后对应调用sys_mknod，其是vfs层的接口。
+
+Sys_mknod(设备名, 设备号)
+
+vfs通过逐一路径link_path_walk，分析出dev挂载了tmpfs，所以调用tmpfs->mknod=shmem_mknod
+
+shmem_mknod(structinode *dir, struct dentry *dentry, int mode, dev_t dev)
+
+inode = shmem_get_inode(dir->i_sb,dir, mode, dev, VM_NORESERVE);
+
+inode = new_inode(sb);
+
+switch (mode & S_IFMT) {
+
+default:
+
+inode->i_op =&shmem_special_inode_operations;
+
+init_special_inode(inode,mode, dev);
+
+break;
+
+case S_IFREG://file
+
+case S_IFDIR://DIR
+
+case S_IFLNK:
+
+//dentry填入inode信息，这时对应的dentry和inode都已经存在于内存中。
+
+d_instantiate(dentry, inode);
+
+8. 可见，tmpfs的目录和文件都是像ramfs一样一般都存在于内存中。通过ls命令来获取目录的信息则由dentry数据结构的内容来获取，而文件的信息由inode数据结构的内容来提供。Inode包括设备文件的设备号i_rdev，文件属性(i_mode: S_ISCHR)，inode操作集i_fop（对于设备文件来说就是如何open这个inode）。
+
+四、open设备文件
+
+9. open设备文件的最终目的是为了获取到该设备驱动的file_operations操作集，而该接口集是struct file的成员，open返回file数据结构指针：
+
+struct file {
+
+    conststruct file_operations *f_op;
+
+    unsignedint f_flags;//可读，可写等
+
+…
+
+};
+
+以下是led设备驱动的操作接口。open("/dev/LED",O_RDWR)就是为了获得led_fops。
+
+static conststruct file_operations led_fops = {
+
+.owner =THIS_MODULE,
+
+.open =led_open,
+
+.write = led_write,
+
+};
+
+10. 仔细看应用程序int fd =open("/dev/LED",O_RDWR)，open的返回值是int，并不是file，其实是为了操作系统和安全考虑。fd位于应用层，而file位于内核层，它们都同属进程相关概念。在Linux中，同一个文件（对应于唯一的inode）可以被不同的进程打开多次，而每次打开都会获得file数据结构。而每个进程都会维护一个已经打开的file数组，fd就是对应file结构的数组下标。因此，file和fd在进程范围内是一一对应的关系。
+
+11. open接口分析，通过系统调用后对应调用sys_open，其是vfs层的接口
+
+Sys_open(/dev/led)
+
+SYSCALL_DEFINE3(open,const char __user *, filename, int, flags, int, mode)
+
+do_sys_open(AT_FDCWD,/dev/tty, flags, mode);
+
+fd = get_unused_fd_flags(flags);
+
+struct file *f = do_filp_open(dfd, tmp, flags, mode, 0);
+
+//path_init返回时nd->dentry即为搜索路径文件名的起点
+
+path_init(dfd, pathname, LOOKUP_PARENT, &nd);
+
+//link_path_walk一步步建立打开路径的各个目录的dentry和inode
+
+link_path_walk(pathname, &nd);
+
+do_last(&nd, &path, open_flag, acc_mode, mode, pathname);
+
+//先处理..父目录和.当前目录
+
+//通过inode节点创建file
+
+filp = nameidata_to_filp(nd);
+
+__dentry_open()
+
+//inode->i_fop=&def_chr_fops
+
+f->f_op =fops_get(inode->i_fop);
+
+if (!open && f->f_op)
+
+open = f->f_op->open;
+
+if (open) {
+
+//调用def_chr_fops->open
+
+error = open(inode, f);
+
+其中inode->i_fop在mknod的init_special_inode调用中被赋值为def_chr_fops。以下该变量的定义，因此, open(inode, f)即调用到chrdev_open。其可以看出是字符设备所对应的文件系统接口，我们姑且称其为字符设备文件系统。
+
+conststruct file_operations def_chr_fops = {
+
+.open = chrdev_open,
+
+};
+
+继续分析chrdev_open：
+
+Kobj_lookup(cdev_map,inode->i_rdev, &idx)即是通过设备的设备号（inode->i_rdev）在cdev_map中查找设备对应的操作集file_operations.关于如何查找，我们在理解字符设备驱动如何注册自己的file_operations后再回头来分析这个问题。
+
+五、字符设备驱动的注册
+
+12. 字符设备对应cdev数据结构：
+
+struct cdev {
+
+    struct kobject kobj; // 每个 cdev 都是一个 kobject
+
+    struct module*owner; // 指向实现驱动的模块
+
+    const structfile_operations *ops; // 操纵这个字符设备文件的方法
+
+    struct list_headlist; //对应的字符设备文件的inode->i_devices 的链表头
+
+    dev_t dev; // 起始设备编号
+
+    unsigned intcount; // 设备范围号大小
+
+};
+
+13. led设备驱动初始化和设备驱动注册
+
+    cdev_init是初始化cdev结构体，并将led_fops填入该结构。
+
+    cdev_add
+
+int cdev_add(struct cdev *p, dev_t dev, unsigned count)
+
+{
+
+    p->dev = dev;
+
+    p->count = count;
+
+    return kobj_map(cdev_map, dev, count, NULL, exact_match, exact_lock, p);
+
+}
+
+    cdev_map是一个全家指针变量，类型如下:
+
+    kobj_map使用hash散列表来存储cdev数据结构。通过注册设备的主设备号major来获得cdev_map->probes数组的索引值i（i = major % 255），然后把一个类型为struct probe的节点对象加入到probes[i]所管理的链表中，probes[i]->data即是cdev数据结构，而probes[i]->dev和range代表字符设备号和范围。
+
+六、再述open设备文件
+
+14. 通过第五步的字符设备的注册过程，应该对Kobj_lookup查找led_ops是很容易理解的。至此，已经获得led设备驱动的led_ops。接着立刻调用file->f_ops->open即调用了led_open，在该函数中会对led用到的GPIO进行ioremap并设置GPIO方向、上下拉等硬件初始化。
+
+15. 最后，chrdev_open一步步返回，最后到
+
+do_sys_open的struct file *f = do_filp_open(dfd, tmp, flags, mode, 0);返回。
+
+Fd_install(fd, f)即是在当前进程中将存有led_ops的file指针填入进程的file数组中，下标是fd。最后将fd返回给用户空间。而用户空间只要传入fd即可找到对应的file数据结构。
+
+七、设备操作
+
+15. 这里以设备写为例，主要是控制led的亮和灭。
+
+write(fd,val,1)系统调用后对应sys_write，其对应所有的文件写，包括目录、一般文件和设备文件，一般文件有位置偏移的概念，即读写之后，当前位置会发生变化，所以如要跳着读写，就需要fseek。对于字符设备文件，没有位置的概念。所以我们重点跟踪vfs_write的过程。
+
+1）fget_light在当前进程中通过fd来获得file指针
+
+2）vfs_write
+
+3) 对于led设备，file->f_op->write即是led_write。
+
+在该接口中实现对led设备的控制。
+
+八、再论字符设备驱动的初始化
+
+综上所述，字符设备的初始化包括两个主要环节：
+
+1）字符设备驱动的注册，即通过cdev_add向系统注册cdev数据结构，提供file_operations操作集和设备号等信息，最终file_operations存放在全局指针变量cdev_map指向的Hash表中，其可以通过设备号索引并遍历得到。
+
+2）通过device_create(设备类, 设备号, 设备名)在sys/class/设备类中创建设备属性文件并发送uevent事件，而mdev利用该信息自动调用mknod在/dev目录下创建对应的设备文件，以便应用程序访问。
+
+注：
+
+device_create和mdev的代码分析请留意后续文章。本文涉及的vfs虚拟文件系统知识（如vfs框架、dentry，inode数据结构等内容）也由后续文章详细讲述。
+
+更多原创技术分享敬请关注微信公众号：嵌入式企鹅圈
