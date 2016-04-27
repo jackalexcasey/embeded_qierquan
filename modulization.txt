@@ -1,0 +1,277 @@
+Linux模块化机制和module_init
+
+    引子：模块化机制优点
+
+模块化机制(module)是Linux系统的一大创新，是Linux驱动开发和运行的基础（当然，module并不仅仅是支撑驱动）。其优点在于：
+
+1.在系统运行动态加载模块，扩充内核的功能。不需要时可以卸载。
+
+2. 修改内核功能，不必重新全部编译整改内核，只需要编译相应模块即可。
+
+3.模块目标代码一旦被加载重定位到内核，其作用域和静态链接的代码完全等价。
+
+本文重点阐述Linux module加载的来龙去脉，其中的奥秘就在于对宏module_init的解读。
+
+    一、模块例子
+
+hello_module.c代码如下：
+
+#include  /* Needed by all modules */
+
+#include  /* Needed for KERN_ALERT */
+
+#include  /*Needed for __init */
+
+static int __init test_init(void){
+
+    printk(KERN_ALERT"Hello world!\n");
+
+    return 0;
+
+}
+
+static void __exit test_exit(void){
+
+    printk(KERN_ALERT"Goodbye world!\n");
+
+}
+
+module_init(test_init);
+
+module_exit(test_exit);
+
+    二、模块编程要点
+
+1．头文件 linux/module.h、linux/kernel.h、linux/init.h
+
+2. 定义模块的初始化函数test_init(名字任意)和卸载函数test_exit(名字任意)。
+
+3. 用宏module_init声明初始化函数，用宏module_exit声明卸载函数。
+
+    三、模块运行
+
+模块代码有两种运行的方式：
+
+1. 编译成可动态加载的module，并通过insmod来动态加载，接着进行初始化。
+
+2. 静态编译链接进内核，在系统启动过程中进行初始化。
+
+有些模块是必须要编译到内核，和内核一起运行的，从不卸载，如vfs、platform_bus等等。
+
+    四、静态链接和初始化
+
+Make menuconfig时选择将模块编译到内核即为静态链接，或者直接在makefile文件中指定为obj-y +=hello_module.o
+
+1module宏展开
+
+头文件路径：include/linux/init.h
+
+//静态编译链接时没有定义宏MODULE
+
+#ifndef MODULE
+
+typedef int (*initcall_t)(void);
+
+#define __define_initcall(level,fn,id) \
+
+static initcall_t __initcall_##fn##id __used \
+
+__attribute__((__section__(".initcall" level ".init"))) = fn
+
+#define device_initcall(fn) __define_initcall("6",fn,6)
+
+#define __initcall(fn) device_initcall(fn)
+
+#define module_init(x) __initcall(x);
+
+所以：
+
+module_init(test_init)展开为：
+
+__initcall(test _init)->
+
+device_initcall(test _init)->
+
+__define_initcall("6", test _init,6)->
+
+static initcall_t __initcall_test_init_6 __attribute__((__section__(".initcall6.init"))) = test_init;
+
+即是定义了一个类型为initcall_t的函数指针变量__initcall_test_init_6，并赋值为test_init，该变量在链接时会链接到section(.initcall6.init).
+
+2linux链接脚本
+
+路径 arch/arm/kernel/vmlinux.ld.S
+
+#include 
+
+SECTIONS{
+
+…
+
+INIT_CALLS
+
+…
+
+}
+
+路径：include/ asm-generic/vmlinux.lds.h
+
+#define INIT_CALLS \
+
+VMLINUX_SYMBOL(__initcall_start) = .; \
+
+INITCALLS \
+
+VMLINUX_SYMBOL(__initcall_end) = .;
+
+#define INITCALLS \
+
+….
+
+*(.initcall6.init) \
+
+…
+
+可见__initcall_test_init_6将会链接到section(.initcall6.init).
+
+3初始化
+
+在linux启动的第三个阶段kernel_init的函数里会调用：
+
+路径init/main.c
+
+Kernel_init
+
+do_basic_setup
+
+do_initcalls
+
+static void __init do_initcalls(void){
+
+    initcall_t *fn;
+
+    for (fn = __early_initcall_end; fn 
+
+    do_one_initcall(*fn);
+
+}
+
+即取出函数指针__initcall_test_init_6的值并进行调用，即执行test_init。
+
+    五、动态链接加载和初始化
+
+Make menuconfig时选择将模块编译成模块即为动态链接，或者直接在makefile文件中指定为obj-m +=hello_module.o
+
+编译成模块的命令是：
+
+make –C $KERNEL_PATH M=$MODULE_PATH modules
+
+即使用linux根目录下的makefile，执行该makefile下的modules伪目标，对当前模块进行编译。编译的结果是可重定位文件，insmod加载时才完成最终的链接动作。
+
+1Module编译选项
+
+Linux根目录下的makefile定义了modules伪目标会用到的编译选项。
+
+//即定义宏MODULE，-D是GCC定义宏的语法。
+
+MODFLAGS = -DMODULE
+
+//GCC编译模块代码时会用到该选项，即定义宏MODULE。这与在头文件中用#define MODULE是一样的。
+
+CFLAGS_MODULE = $(MODFLAGS)
+
+2Module_init宏展开
+
+头文件路径：include/linux/init.h
+
+#ifndef MODULE /*编译成module时定义了宏MODULE*/
+
+#else /* MODULE obj-m*/
+
+typedef int (*initcall_t)(void);
+
+#define module_init(initfn) \
+
+static inline initcall_t __inittest(void) \
+
+{ return initfn; } \
+
+int init_module(void) __attribute__((alias(#initfn)));
+
+__inittest仅仅是为了检测定义的函数是否符合initcall_t类型，如果不是__inittest类型在编译时将会报错。所以真正的宏定义是：
+
+#define module_init(initfn)
+
+int init_module(void) __attribute__((alias(#initfn)));
+
+alias属性是GCC的特有属性，将定义init_module为函数initfn的别名。所以module_init(test_init)的作用就是定义一个变量名init_module，其地址和test_init是一样的。
+
+3Hello_module.mod.c
+
+编译成module的模块都会自动产生一个*.mod.c的文件，Hello_module.mod.c的内容如下：
+
+struct module __this_module
+
+__attribute__((section(".gnu.linkonce.this_module"))) = {
+
+    .name = KBUILD_MODNAME,
+
+    .init = init_module,
+
+    #ifdef CONFIG_MODULE_UNLOAD
+
+    .exit = cleanup_module,
+
+    #endif
+
+    .arch = MODULE_ARCH_INIT,
+
+};
+
+即定义了一个类型为module的全局变量__this_module，其成员init即为init_module，也即是test_init.并且该变量会链接到section(".gnu.linkonce.this_module").
+
+4动态加载
+
+insmod是busybox提供的用户层命令：
+
+路径busybox/modutils/ insmod.c
+
+insmod_main
+
+bb_init_module
+
+init_module
+
+路径busybox/modutils/modutils.c：
+
+# define init_module(mod, len, opts) .\
+
+syscall(__NR_init_module, mod, len, opts)
+
+该系统调用对应内核层的sys_init_module函数。
+
+路径：kernel/module.c
+
+SYSCALL_DEFINE3(init_module,…)
+
+//加载模块的ko文件，并解释各个section，重定位
+
+mod = load_module(umod, len, uargs);
+
+//查找section(".gnu.linkonce.this_module")
+
+modindex = find_sec(hdr, sechdrs, secstrings,
+
+".gnu.linkonce.this_module");
+
+//找到Hello_module.mod.c定义的module数据结构
+
+mod = (void *)sechdrs[modindex].sh_addr;
+
+if (mod->init != NULL)
+
+ret = do_one_initcall(mod->init); //调用test_init.
+
+模块的传参、符号导出、模块依赖等机制以后再另文描述
+
+更多原创技术分享敬请关注微信公众号：嵌入式企鹅圈
