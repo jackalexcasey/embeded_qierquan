@@ -1,0 +1,396 @@
+Linux 设备文件的创建和mdev
+
+    引子
+
+本文是嵌入式企鹅圈开篇--《linux字符设备驱动剖析》的姐妹篇，在上述文章里面我们详细描述了字符设备驱动框架涉及的驱动注册、通过设备文件来访问驱动等知识，并明确通过device_create接口并结合mdev来创建设备文件，但没有展开这个知识点。本文将从代码级去理解Linux设备类和设备文件的创建过程。通过这两篇文章，我们将可以对linux字符设备驱动的机制和脉络有全面的认识。
+
+以下程序分析没有缩进，编辑了好几次都不行，耐心点才能跟踪完整个代码:-)
+
+    一、设备类相关知识
+
+设备类是虚拟的，并没有直接对应的物理实物，只是为了更好地管理同一类设备导出到用户空间而产生的目录和文件。整个过程涉及到sysfs文件系统，该文件系统是为了展示linux设备驱动模型而构建的文件系统，是基于ramfs，linux根目录中的/sysfs即挂载了sysfs文件系统。
+
+Struct kobject数据结构是sysfs的基础，kobject在sysfs中代表一个目录，而linux的驱动(struct driver)、设备(struct device)、设备类(struct class)均是从kobject进行派生的，因此他们在sysfs中都对应于一个目录。而数据结构中附属的struct device_attribute、driver_attribute、class_attribute等属性数据结构在sysfs中则代表一个普通的文件。
+
+Struct kset是struct kobject的容器，即Struct kset可以成为同一类struct kobject的父亲，而其自身也有kobject成员，因此其又可能和其他kobject成为上一级kset的子成员。
+
+本文无意对sysfs和linux设备驱动模型进行展开，以后再另写文章进行分析。
+
+    二、两种创建设备文件的方式
+
+在设备驱动中cdev_add将struct file_operations和设备号注册到系统后，为了能够自动产生驱动对应的设备文件，需要调用class_create和device_create，并通过uevent机制调用mdev（嵌入式linux由busybox提供）来调用mknod创建设备文件。当然也可以不调用这两个接口，那就手工通过命令行mknod来创建设备文件。
+
+    三、设备类和设备相关数据结构
+
+## 1include/linux/kobject.h
+
+struct kobject {
+
+    const char *name;//名称
+
+    struct list_head entry;//kobject链表
+
+    struct kobject *parent;//即所属kset的kobject
+
+    struct kset *kset;//所属kset
+
+    struct kobj_type *ktype;//属性操作接口
+
+    …
+
+};
+
+struct kset {
+
+    struct list_head list;//管理同属于kset的kobject
+
+    struct kobject kobj;//可以成为上一级父kset的子目录
+
+    const struct kset_uevent_ops *uevent_ops;//uevent处理接口
+
+};
+
+假设Kobject A代表一个目录，kset B代表几个目录（包括A）的共同的父目录。则A.kset=B; A.parent=B.kobj.
+2include/linux/device.h
+
+struct class {//设备类
+
+const char *name; //设备类名称
+
+struct module *owner;//创建设备类的module
+
+struct class_attribute *class_attrs;//设备类属性
+
+struct device_attribute *dev_attrs;//设备属性
+
+struct kobject *dev_kobj;//kobject再sysfs中代表一个目录
+
+….
+
+struct class_private *p;//设备类得以注册到系统的连接件
+
+};
+
+3drivers/base/base.h
+
+struct class_private {
+
+    //该设备类同样是一个kset，包含下面的class_devices；同时在class_subsys填充父kset
+
+    struct kset class_subsys;
+
+    struct klist class_devices;//设备类包含的设备（kobject）
+
+    …
+
+    struct class *class;//指向设备类数据结构，即要创建的本级目录信息
+
+};
+
+4include/linux/device.h
+
+struct device {//设备
+
+    struct device *parent;//sysfs/devices/中的父设备
+
+    struct device_private *p;//设备得以注册到系统的连接件
+
+    struct kobject kobj;//设备目录
+
+    const char *init_name;//设备名称
+
+    struct bus_type *bus;//设备所属总线
+
+    struct device_driver *driver; //设备使用的驱动
+
+    struct klist_node knode_class;//连接到设备类的klist
+
+    struct class *class;//所属设备类
+
+    const struct attribute_group **groups;
+
+    …
+
+}
+
+5drivers/base/base.h
+
+struct device_private {
+
+    struct klist klist_children;//连接子设备
+
+    struct klist_node knode_parent;//加入到父设备链表
+
+    struct klist_node knode_driver;//加入到驱动的设备链表
+
+    struct klist_node knode_bus;//加入到总线的链表
+
+    struct device *device;//对应设备结构
+
+};
+
+6解释
+
+class_private是class的私有结构，class通过class_private注册到系统中；device_private是device的私有结构，device通过device_private注册到系统中。注册到系统中也是将相应的数据结构加入到系统已经存在的链表中，但是这些链接的细节并不希望暴露给用户，也没有必要暴露出来，所以才有private的结构。而class和device则通过sysfs向用户层提供信息。
+
+    四、创建设备类目录文件
+
+1.在驱动通过cdev_add将struct file_operations接口集和设备注册到系统后，即利用class_create接口来创建设备类目录文件。
+
+led_class = class_create(THIS_MODULE, "led_class");
+
+__class_create(owner, name, &__key);
+
+cls->name = name;//设备类名
+
+cls->owner = owner;//所属module
+
+retval = __class_register(cls, key);
+
+struct class_private *cp;
+
+//将类的名字led_class赋值给对应的kset
+
+kobject_set_name(&cp->class_subsys.kobj, "%s", cls->name);
+
+//填充class_subsys所属的父kset：ket:sysfs/class.
+
+cp->class_subsys.kobj.kset = class_kset;
+
+//填充class属性操作接口
+
+cp->class_subsys.kobj.ktype = &class_ktype;
+
+cp->class = cls;//通过cp可以找到class
+
+cls->p = cp;//通过class可以找到cp
+
+//创建led_class设备类目录
+
+kset_register(&cp->class_subsys);
+
+//在led_class目录创建class属性文件
+
+add_class_attrs(class_get(cls))；
+
+2.继续展开kset_register
+
+kset_register(&cp->class_subsys);
+
+kobject_add_internal(&k->kobj);
+
+// parent即class_kset.kobj,即/sysfs/class对应的目录
+
+parent = kobject_get(kobj->parent);
+
+create_dir(kobj);
+
+//创建一个led _class设备类目录
+
+sysfs_create_dir(kobj);
+
+//该接口是sysfs文件系统接口，代表创建一个目录，不再展开。
+
+3.上述提到的class_kset在class_init被创建
+
+class_kset = kset_create_and_add("class", NULL, NULL);
+
+第三个传参为NULL，代表默认在/sysfs/创建class目录。
+
+    五、创建设备目录和设备属性文件
+
+1.利用class_create接口来创建设备类目录文件后，再利用device_create接口来创建具体设备目录和设备属性文件。
+
+led_device = device_create(led_class, NULL, led_devno, NULL, "led");
+
+device_create_vargs
+
+dev->devt = devt;//设备号
+
+dev->class = class;//设备类led_class
+
+dev->parent = parent;//父设备，这里是NULL
+
+kobject_set_name_vargs(&dev->kobj, fmt, args)//设备名”led”
+
+device_register(dev) 注册设备
+
+2.继续展开device_register(dev)
+
+device_initialize(dev);
+
+dev->kobj.kset = devices_kset;//设备所属/sysfs/devices/
+
+device_add(dev)
+
+device_private_init(dev)//初始化device_private
+
+dev_set_name(dev, "%s", dev->init_name);//赋值dev->kobject的名称
+
+setup_parent(dev, parent);//建立device和父设备的kobject的联系
+
+//kobject_add在/sysfs/devices/目录下创建设备目录led，kobject_add是和kset_register相似的接口，只不过前者针对kobject，后者针对kset。
+
+kobject_add(&dev->kobj, dev->kobj.parent, NULL);
+
+kobject_add_varg
+
+kobj->parent = parent;
+
+kobject_add_internal(kobj)
+
+create_dir(kobj);//创建设备目录
+
+//在刚创建的/sysfs/devices/led目录下创建uevent属性文件,名称是”uevent”
+
+device_create_file(dev, &uevent_attr);
+
+//在刚创建的/sysfs/devices/led目录下创建dev属性文件，名称是”dev”，该属性文件的内容就是设备号
+
+device_create_file(dev, &devt_attr);
+
+//在/sysfs/class/led_class/目录下建立led设备的符号连接，所以打开/sysfs/class/led_class/led/目录也能看到dev属性文件，读出设备号。
+
+device_add_class_symlinks(dev);
+
+//创建device属性文件，包括设备所属总线的属性和attribute_group属性
+
+device_add_attrs()
+
+bus_add_device(dev) //将设备加入总线
+
+//触发uevent机制，并通过调用mdev来创建设备文件。
+
+kobject_uevent(&dev->kobj, KOBJ_ADD);
+
+//匹配设备和总线的驱动，匹配成功就调用驱动的probe接口，不再展开
+
+bus_probe_device(dev);
+
+3.展开kobject_uevent(&dev->kobj, KOBJ_ADD);
+
+kobject_uevent_env(kobj, action, NULL);
+
+kset = top_kobj->kset;
+
+uevent_ops = kset->uevent_ops; //即device_uevent_ops
+
+// subsystem即设备所属的设备类的名称”led_class”
+
+subsystem = uevent_ops->name(kset, kobj);
+
+//devpath即/sysfs/devices/led/
+
+devpath = kobject_get_path(kobj, GFP_KERNEL);
+
+//添加各种环境变量
+
+add_uevent_var(env, "ACTION=%s", action_string);
+
+add_uevent_var(env, "DEVPATH=%s", devpath);
+
+add_uevent_var(env, "SUBSYSTEM=%s", subsystem);
+
+uevent_ops->uevent(kset, kobj, env);
+
+add_uevent_var(env, "MAJOR=%u", MAJOR(dev->devt));
+
+add_uevent_var(env, "MINOR=%u", MINOR(dev->devt));
+
+add_uevent_var(env, "DEVNAME=%s", name);
+
+add_uevent_var(env, "DEVTYPE=%s", dev->type->name);
+
+//还会增加总线相关的一些属性环境变量等等。
+
+#if defined(CONFIG_NET)//如果是PC的linux会通过socket的方式向应用层发送uevent事件消息，但在嵌入式linux中不启用该机制。
+
+#endif
+
+argv [0] = uevent_helper;//即/sbin/mdev
+
+argv [1] = (char *)subsystem;//”led_class”
+
+argv [2] = NULL;
+
+add_uevent_var(env, "HOME=/");
+
+add_uevent_var(env,"PATH=/sbin:/bin:/usr/sbin:/usr/bin");
+
+call_usermodehelper(argv[0], argv,env->envp, UMH_WAIT_EXEC);
+
+4.上述提到的devices_kset在devices_init被创建
+
+devices_kset = kset_create_and_add("devices", &device_uevent_ops, NULL);
+
+//第三个传参为NULL，代表默认在/sysfs/创建devices目录
+
+5.上述设备属性文件
+
+static struct device_attribute devt_attr =
+
+    __ATTR(dev, S_IRUGO, show_dev, NULL);
+
+    static ssize_t show_dev(struct device *dev, struct device_attribute *attr,char *buf){{
+
+    return print_dev_t(buf, dev->devt);//即返回设备的设备号
+
+}
+
+6.devices设备目录响应uevent事件的操作
+
+static const struct kset_uevent_ops device_uevent_ops = {
+
+    .filter =dev_uevent_filter,
+
+    .name = dev_uevent_name,
+
+    .uevent = dev_uevent,
+
+};
+
+7.call_usermodehelper是从内核空间调用用户空间程序的接口。
+
+8.对于嵌入式系统来说，busybox采用的是mdev，在系统启动脚本rcS中会使用命令
+
+echo /sbin/mdev > /proc/sys/kernel/hotplug
+
+uevent_helper[]数组即读入/proc/sys/kernel/hotplug文件的内容，即 “/sbin/mdev” .
+
+    六、创建设备文件
+
+轮到mdev出场了，以上描述都是在sysfs文件系统中创建目录或者文件，而应用程序访问的设备文件则需要创建在/dev/目录下。该项工作由mdev完成。
+
+Mdev的原理是解释/etc/mdev.conf文件定义的命名设备文件的规则，并在该规则下根据环境变量的要求来创建设备文件。Mdev.conf由用户层指定，因此更具灵活性。本文无意展开对mdev配置脚本的分析。
+
+Busybox/util-linux/mdev.c
+
+int mdev_main(int argc UNUSED_PARAM, char **argv)
+
+xchdir("/dev");
+
+if (argv[1] && strcmp(argv[1], "-s")//系统启动时mdev –s才会执行这个分支
+
+else
+
+action = getenv("ACTION");
+
+env_path = getenv("DEVPATH");
+
+G.subsystem = getenv("SUBSYSTEM");
+
+snprintf(temp, PATH_MAX, "/sys%s", env_path);//到/sysfs/devices/led目录
+
+make_device(temp, /*delete:*/ 0);
+
+strcpy(dev_maj_min, "/dev"); //读出dev属性文件，得到设备号
+
+open_read_close(path, dev_maj_min + 1, 64);
+
+….
+
+mknod(node_name, rule->mode | type, makedev(major, minor))
+
+最终我们会跟踪到mknod在/dev/目录下创建了设备文件。
+
+更多原创技术分享敬请关注微信公众号：嵌入式企鹅圈
